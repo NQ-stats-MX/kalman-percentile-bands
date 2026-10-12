@@ -3,8 +3,6 @@ A mean-reversion indicator for TradingView (Pine Script v6). It plots a volatili
 
 Built for intraday scalping (tested on NQ, 1-minute), but it works on any symbol and timeframe.
 
----
-
 ## Why percentiles instead of standard deviations?
 
 Bollinger-style bands assume price deviations follow a normal distribution. Markets don't: they have fat tails and are often skewed. KPB measures the **actual distribution** of deviations, so a "95% band" really contains about 95% of the observed price action.
