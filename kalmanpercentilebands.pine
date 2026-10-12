@@ -1,0 +1,194 @@
+//@version=6
+indicator("Kalman Percentile Bands", shorttitle="KPB", overlay=true, max_labels_count=50)
+
+// ============================================================================
+// Kalman mean + 3 empirical percentile bands on each side.
+//
+//  1) Mean: local-level Kalman filter. Optionally vol-adaptive: the gain rises
+//     when short-term vol exceeds long-term vol, so the mean keeps up in fast
+//     markets and stays calm in quiet ones.
+//  2) Volatility: EWMA of 1-bar price changes. Deviation from the mean is
+//     normalized by it:  z = (price - mean) / vol
+//  3) Percentiles: the bands are empirical percentiles of z over a lookback,
+//     scaled back by current vol:  band = mean + percentile(z) * vol
+//     -> no normal-distribution assumption, fat tails and skew are respected,
+//        and the bands still widen/narrow instantly with volatility.
+// ============================================================================
+
+// ---- Calculation inputs ------------------------------------------------------
+gM = "Kalman mean"
+src      = input.source(close, "Source", group=gM)
+qr       = input.float(0.02, "Q/R sensitivity (higher = faster mean)", minval=0.0001, step=0.005, group=gM)
+adaptQ   = input.bool(true, "Volatility-adaptive mean", group=gM, tooltip="Scales the Kalman process noise by (fast vol / slow vol)^2, clamped. The mean speeds up in high-vol bursts and slows down in quiet markets.")
+vFastLen = input.int(20, "Fast vol length", minval=2, group=gM)
+vSlowLen = input.int(200, "Slow vol length", minval=10, group=gM)
+
+gP = "Volatility & percentiles"
+volLen   = input.int(30, "Band volatility length (EWMA)", minval=2, group=gP, tooltip="Lower = bands react faster to volatility changes.")
+lookback = input.int(1000, "Percentile lookback (bars)", minval=100, maxval=5000, group=gP, tooltip="Needs enough bars for the tails: the 99% band uses the extreme 0.5% on each side. Lower it if the script is slow.")
+mode     = input.string("Central (two-sided)", "Percentile mode", options=["Central (two-sided)", "One-sided"], group=gP, tooltip="Central: 95 = the band pair contains 95% of observations (2.5% above, 2.5% below).\nOne-sided: 95 = 95th percentile up, 5th percentile down (5% beyond each band).")
+lagBands = input.bool(true, "Bands ignore the current bar", group=gP, tooltip="Bands use the previous bar's percentiles and vol, so a spike can't widen its own band.")
+
+// ---- Band inputs (percentile + styling) -----------------------------------------
+gB1 = "Band 1"
+show1 = input.bool(true, "Show", group=gB1, inline="1a")
+p1    = input.float(80.0, "Percentile", minval=1.0, maxval=99.99, step=0.5, group=gB1, inline="1a")
+cU1   = input.color(color.new(color.red, 60), "Upper", group=gB1, inline="1b")
+cL1   = input.color(color.new(color.green, 60), "Lower", group=gB1, inline="1b")
+w1    = input.int(1, "Width", minval=1, maxval=6, group=gB1, inline="1c")
+s1    = input.string("Dotted", "Style", options=["Solid", "Dashed", "Dotted"], group=gB1, inline="1c")
+
+gB2 = "Band 2"
+show2 = input.bool(true, "Show", group=gB2, inline="2a")
+p2    = input.float(95.0, "Percentile", minval=1.0, maxval=99.99, step=0.5, group=gB2, inline="2a")
+cU2   = input.color(color.new(color.red, 30), "Upper", group=gB2, inline="2b")
+cL2   = input.color(color.new(color.green, 30), "Lower", group=gB2, inline="2b")
+w2    = input.int(1, "Width", minval=1, maxval=6, group=gB2, inline="2c")
+s2    = input.string("Dashed", "Style", options=["Solid", "Dashed", "Dotted"], group=gB2, inline="2c")
+
+gB3 = "Band 3"
+show3 = input.bool(true, "Show", group=gB3, inline="3a")
+p3    = input.float(99.0, "Percentile", minval=1.0, maxval=99.99, step=0.5, group=gB3, inline="3a")
+cU3   = input.color(color.new(color.red, 0), "Upper", group=gB3, inline="3b")
+cL3   = input.color(color.new(color.green, 0), "Lower", group=gB3, inline="3b")
+w3    = input.int(2, "Width", minval=1, maxval=6, group=gB3, inline="3c")
+s3    = input.string("Solid", "Style", options=["Solid", "Dashed", "Dotted"], group=gB3, inline="3c")
+
+gMS = "Mean line"
+showM = input.bool(true, "Show", group=gMS, inline="ma")
+cM    = input.color(color.new(color.orange, 0), "Color", group=gMS, inline="ma")
+wM    = input.int(2, "Width", minval=1, maxval=6, group=gMS, inline="mb")
+sM    = input.string("Solid", "Style", options=["Solid", "Dashed", "Dotted"], group=gMS, inline="mb")
+
+gF = "Zone fills"
+showFill = input.bool(true, "Show zone fills", group=gF)
+fU1 = input.color(color.new(color.red, 95), "Upper  mean–B1", group=gF, inline="fu1")
+fU2 = input.color(color.new(color.red, 90), "B1–B2", group=gF, inline="fu1")
+fU3 = input.color(color.new(color.red, 82), "B2–B3", group=gF, inline="fu1")
+fL1 = input.color(color.new(color.green, 95), "Lower  mean–B1", group=gF, inline="fl1")
+fL2 = input.color(color.new(color.green, 90), "B1–B2", group=gF, inline="fl1")
+fL3 = input.color(color.new(color.green, 82), "B2–B3", group=gF, inline="fl1")
+
+gBG = "Background highlight"
+bgOn  = input.bool(false, "Highlight when close is beyond a band", group=gBG)
+bgLvl = input.int(3, "Band", options=[1, 2, 3], group=gBG)
+bgUp  = input.color(color.new(color.red, 85), "Above upper", group=gBG, inline="bg")
+bgLo  = input.color(color.new(color.green, 85), "Below lower", group=gBG, inline="bg")
+
+gL = "Labels & table"
+showLbl = input.bool(true, "Band labels on last bar", group=gL)
+lblOff  = input.int(3, "Label offset (bars)", minval=0, maxval=50, group=gL)
+lblSize = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gL)
+showTbl = input.bool(true, "Show readout table", group=gL)
+tblPos  = input.string("Top right", "Table position", options=["Top right", "Bottom right", "Top left", "Bottom left"], group=gL)
+
+// ---- Volatility -------------------------------------------------------------------
+d1    = nz(src - src[1])
+vFast = math.sqrt(ta.ema(d1 * d1, vFastLen))
+vSlow = math.sqrt(ta.ema(d1 * d1, vSlowLen))
+vol   = math.sqrt(ta.ema(d1 * d1, volLen))
+
+// ---- Kalman mean (local level, R = 1, Q = qr * vol-ratio^2) -----------------------
+ratio = adaptQ and vSlow > 0 ? math.max(0.5, math.min(3.0, vFast / vSlow)) : 1.0
+qEff  = qr * ratio * ratio
+
+var float km = na
+var float kP = 1.0
+if na(km)
+    km := src
+else
+    float pp = kP + qEff
+    float kg = pp / (pp + 1.0)
+    km := km + kg * (src - km)
+    kP := (1.0 - kg) * pp
+
+// ---- Normalized deviation and percentile bands ---------------------------------------
+z = vol > 0 ? (src - km) / vol : na
+
+central = mode == "Central (two-sided)"
+pu1 = central ? 50.0 + p1 / 2.0 : p1
+pl1 = central ? 50.0 - p1 / 2.0 : 100.0 - p1
+pu2 = central ? 50.0 + p2 / 2.0 : p2
+pl2 = central ? 50.0 - p2 / 2.0 : 100.0 - p2
+pu3 = central ? 50.0 + p3 / 2.0 : p3
+pl3 = central ? 50.0 - p3 / 2.0 : 100.0 - p3
+
+qU1 = ta.percentile_linear_interpolation(z, lookback, pu1)
+qL1 = ta.percentile_linear_interpolation(z, lookback, pl1)
+qU2 = ta.percentile_linear_interpolation(z, lookback, pu2)
+qL2 = ta.percentile_linear_interpolation(z, lookback, pl2)
+qU3 = ta.percentile_linear_interpolation(z, lookback, pu3)
+qL3 = ta.percentile_linear_interpolation(z, lookback, pl3)
+
+k  = lagBands ? 1 : 0
+vB = vol[k]
+u1 = km + qU1[k] * vB
+l1 = km + qL1[k] * vB
+u2 = km + qU2[k] * vB
+l2 = km + qL2[k] * vB
+u3 = km + qU3[k] * vB
+l3 = km + qL3[k] * vB
+
+pRank = ta.percentrank(z, lookback)
+
+// ---- Line styles ------------------------------------------------------------------------
+lsM = sM == "Dashed" ? plot.linestyle_dashed : sM == "Dotted" ? plot.linestyle_dotted : plot.linestyle_solid
+ls1 = s1 == "Dashed" ? plot.linestyle_dashed : s1 == "Dotted" ? plot.linestyle_dotted : plot.linestyle_solid
+ls2 = s2 == "Dashed" ? plot.linestyle_dashed : s2 == "Dotted" ? plot.linestyle_dotted : plot.linestyle_solid
+ls3 = s3 == "Dashed" ? plot.linestyle_dashed : s3 == "Dotted" ? plot.linestyle_dotted : plot.linestyle_solid
+
+// ---- Plots ---------------------------------------------------------------------------------
+pM  = plot(km, "Kalman mean", color=showM ? cM : na, linewidth=wM, linestyle=lsM)
+pU1 = plot(show1 ? u1 : na, "Upper band 1", color=cU1, linewidth=w1, linestyle=ls1)
+pL1 = plot(show1 ? l1 : na, "Lower band 1", color=cL1, linewidth=w1, linestyle=ls1)
+pU2 = plot(show2 ? u2 : na, "Upper band 2", color=cU2, linewidth=w2, linestyle=ls2)
+pL2 = plot(show2 ? l2 : na, "Lower band 2", color=cL2, linewidth=w2, linestyle=ls2)
+pU3 = plot(show3 ? u3 : na, "Upper band 3", color=cU3, linewidth=w3, linestyle=ls3)
+pL3 = plot(show3 ? l3 : na, "Lower band 3", color=cL3, linewidth=w3, linestyle=ls3)
+
+fill(pM,  pU1, color=showFill ? fU1 : na, title="Fill upper mean–B1")
+fill(pU1, pU2, color=showFill ? fU2 : na, title="Fill upper B1–B2")
+fill(pU2, pU3, color=showFill ? fU3 : na, title="Fill upper B2–B3")
+fill(pM,  pL1, color=showFill ? fL1 : na, title="Fill lower mean–B1")
+fill(pL1, pL2, color=showFill ? fL2 : na, title="Fill lower B1–B2")
+fill(pL2, pL3, color=showFill ? fL3 : na, title="Fill lower B2–B3")
+
+bgU = bgLvl == 1 ? u1 : bgLvl == 2 ? u2 : u3
+bgL = bgLvl == 1 ? l1 : bgLvl == 2 ? l2 : l3
+bgcolor(bgOn and close > bgU ? bgUp : bgOn and close < bgL ? bgLo : na, title="Beyond-band highlight")
+
+// ---- Labels on the last bar -----------------------------------------------------------------
+lSize = lblSize == "Tiny" ? size.tiny : lblSize == "Normal" ? size.normal : size.small
+var array<label> lbls = array.new<label>()
+
+addLbl(float y, string t, color c) =>
+    if not na(y)
+        lbls.push(label.new(bar_index + lblOff, y, t + "  " + str.tostring(y, format.mintick), color=color.new(color.black, 100), style=label.style_label_left, textcolor=color.new(c, 0), size=lSize))
+
+if barstate.islast
+    for l in lbls
+        l.delete()
+    lbls.clear()
+    if showLbl
+        if show1
+            addLbl(u1, str.tostring(p1) + "%", cU1)
+            addLbl(l1, str.tostring(p1) + "%", cL1)
+        if show2
+            addLbl(u2, str.tostring(p2) + "%", cU2)
+            addLbl(l2, str.tostring(p2) + "%", cL2)
+        if show3
+            addLbl(u3, str.tostring(p3) + "%", cU3)
+            addLbl(l3, str.tostring(p3) + "%", cL3)
+        if showM
+            addLbl(km, "Mean", cM)
+
+// ---- Readout table -------------------------------------------------------------------------------
+tPos = tblPos == "Bottom right" ? position.bottom_right : tblPos == "Top left" ? position.top_left : tblPos == "Bottom left" ? position.bottom_left : position.top_right
+var table tb = table.new(tPos, 2, 3, bgcolor=color.new(color.black, 30), border_width=1)
+if showTbl and barstate.islast
+    table.cell(tb, 0, 0, "Percentile rank", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, na(pRank) ? "-" : str.tostring(pRank, "#.0"), text_color=pRank >= 50 ? color.red : color.lime, text_size=size.small)
+    table.cell(tb, 0, 1, "z (vol units)", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 1, na(z) ? "-" : str.tostring(z, "#.00"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 2, "Mean speed (vol ratio)", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 2, str.tostring(ratio, "#.00") + "x", text_color=color.white, text_size=size.small)
